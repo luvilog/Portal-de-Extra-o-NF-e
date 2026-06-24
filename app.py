@@ -29,16 +29,32 @@ def get_gemini_client():
 
 PROMPT = """Analise esta imagem de um DANFE ou Nota Fiscal e extraia a CHAVE DE ACESSO de 44 digitos numericos.
 A chave geralmente aparece abaixo do codigo de barras ou no topo do documento.
-Responda SOMENTE com JSON puro, sem markdown, sem crases:
-{"encontrou": true, "chave_acesso": "44 digitos sem espacos", "confianca": "alta/media/baixa"}
-Se nao encontrar:
-{"encontrou": false, "chave_acesso": null, "confianca": null}"""
+Responda APENAS com os 44 digitos da chave, sem espacos, sem texto extra, sem JSON.
+Se nao encontrar, responda apenas: NAO_ENCONTRADA"""
 
 MODELOS = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
 
+def extrair_chave_do_texto(texto):
+    """Tenta extrair uma sequencia de 44 digitos de qualquer texto."""
+    # Remove tudo que nao e digito e tenta achar 44 consecutivos
+    somente_digitos = re.sub(r"\D", "", texto)
+
+    # Procura sequencia de exatamente 44 digitos
+    match = re.search(r"\d{44}", somente_digitos)
+    if match:
+        return match.group(0)
+
+    # Se o texto todo limpo tem 44 digitos
+    if len(somente_digitos) == 44:
+        return somente_digitos
+
+    return None
+
+
 def chamar_gemini(client, conteudo, mime):
-    """Tenta ate 3 vezes, com modelo reserva se o principal falhar."""
+    """Tenta ate 3 vezes com modelo reserva."""
+    ultimo_erro = None
     for modelo in MODELOS:
         for tentativa in range(3):
             try:
@@ -54,17 +70,31 @@ def chamar_gemini(client, conteudo, mime):
                     ),
                 )
                 texto = response.text.strip()
-                texto = re.sub(r"```json\s*", "", texto)
-                texto = re.sub(r"```\s*$", "", texto).strip()
-                return json.loads(texto)
+
+                # Se respondeu que nao encontrou
+                if "NAO_ENCONTRADA" in texto.upper() or "NAO ENCONTR" in texto.upper():
+                    return {"encontrou": False, "chave_acesso": None}
+
+                # Tenta extrair a chave do texto (funciona com JSON, texto puro, etc)
+                chave = extrair_chave_do_texto(texto)
+                if chave:
+                    return {"encontrou": True, "chave_acesso": chave, "confianca": "alta"}
+
+                # Se nao encontrou 44 digitos na resposta
+                return {"encontrou": False, "chave_acesso": None}
+
             except Exception as e:
-                erro_str = str(e)
-                if "503" in erro_str or "UNAVAILABLE" in erro_str or "overloaded" in erro_str.lower():
+                ultimo_erro = str(e)
+                if "503" in ultimo_erro or "UNAVAILABLE" in ultimo_erro or "overloaded" in ultimo_erro.lower():
                     time.sleep(2 * (tentativa + 1))
                     continue
+                elif tentativa < 2:
+                    time.sleep(1)
+                    continue
                 else:
-                    raise e
-    raise RuntimeError("Servidores do Google indisponiveis. Tente novamente em 1 minuto.")
+                    break
+
+    raise RuntimeError("Servidores indisponiveis. Tente novamente em 1 minuto. (" + str(ultimo_erro)[:100] + ")")
 
 
 def validar_chave(chave):
@@ -154,7 +184,7 @@ footer{text-align:center;padding:1rem;font-size:0.7rem;color:#6b7280}
 </div>
 <input type="file" id="arq" accept="image/*">
 <div id="prev"><img id="previmg" src="" alt=""><div id="prevbar"><span id="nomeArq"></span><button id="trocar" type="button">Trocar foto</button></div></div>
-<div id="load"><div class="sp"></div><p id="loadtxt">Lendo a chave de acesso...</p></div>
+<div id="load"><div class="sp"></div><p>Lendo a chave de acesso...</p></div>
 <div id="res"></div>
 </main>
 <footer>LUVI LOG Transportes</footer>
@@ -198,7 +228,6 @@ document.getElementById("arq").onchange = function() {
 
 function enviar(file) {
     document.getElementById("load").style.display = "block";
-    document.getElementById("loadtxt").textContent = "Lendo a chave de acesso...";
     document.getElementById("res").style.display = "none";
 
     var fd = new FormData();
@@ -305,12 +334,12 @@ async def extrair_chave(foto: UploadFile = File(...)):
     try:
         resultado = chamar_gemini(client, conteudo, mime)
     except Exception as e:
-        return {"sucesso": False, "erro": "Erro ao processar: " + str(e)}
+        return {"sucesso": False, "erro": str(e)}
 
     if not resultado.get("encontrou") or not resultado.get("chave_acesso"):
         return {"sucesso": False, "erro": "Nao encontrou a chave na imagem. Tente com foto mais nitida."}
 
-    chave = re.sub(r"\D", "", resultado["chave_acesso"])
+    chave = resultado["chave_acesso"]
 
     if len(chave) != 44:
         return {"sucesso": False, "erro": "Chave tem " + str(len(chave)) + " digitos (esperado: 44)."}
