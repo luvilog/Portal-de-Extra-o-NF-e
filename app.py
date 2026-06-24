@@ -5,6 +5,7 @@ LUVI LOG - Extrator de Chave de Acesso NF-e
 import os
 import re
 import json
+import time
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse
@@ -32,6 +33,38 @@ Responda SOMENTE com JSON puro, sem markdown, sem crases:
 {"encontrou": true, "chave_acesso": "44 digitos sem espacos", "confianca": "alta/media/baixa"}
 Se nao encontrar:
 {"encontrou": false, "chave_acesso": null, "confianca": null}"""
+
+MODELOS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+
+
+def chamar_gemini(client, conteudo, mime):
+    """Tenta ate 3 vezes, com modelo reserva se o principal falhar."""
+    for modelo in MODELOS:
+        for tentativa in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=modelo,
+                    contents=[
+                        types.Part.from_bytes(data=conteudo, mime_type=mime),
+                        PROMPT,
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=300,
+                    ),
+                )
+                texto = response.text.strip()
+                texto = re.sub(r"```json\s*", "", texto)
+                texto = re.sub(r"```\s*$", "", texto).strip()
+                return json.loads(texto)
+            except Exception as e:
+                erro_str = str(e)
+                if "503" in erro_str or "UNAVAILABLE" in erro_str or "overloaded" in erro_str.lower():
+                    time.sleep(2 * (tentativa + 1))
+                    continue
+                else:
+                    raise e
+    raise RuntimeError("Servidores do Google indisponiveis. Tente novamente em 1 minuto.")
 
 
 def validar_chave(chave):
@@ -107,6 +140,7 @@ main{flex:1;padding:1.5rem;max-width:540px;margin:0 auto;width:100%}
 .ii small{font-size:0.65rem;text-transform:uppercase;color:#6b7280;font-weight:600}
 .ii div{font-size:0.85rem;font-weight:600;margin-top:0.1rem}
 .errmsg{padding:1.2rem;font-size:0.9rem;color:#991b1b}
+#retry{display:block;width:100%;margin-top:0.8rem;padding:0.75rem;background:#1a3a6b;color:#fff;border:none;border-radius:8px;font-size:0.9rem;font-weight:600;cursor:pointer}
 footer{text-align:center;padding:1rem;font-size:0.7rem;color:#6b7280}
 </style>
 </head>
@@ -120,12 +154,13 @@ footer{text-align:center;padding:1rem;font-size:0.7rem;color:#6b7280}
 </div>
 <input type="file" id="arq" accept="image/*">
 <div id="prev"><img id="previmg" src="" alt=""><div id="prevbar"><span id="nomeArq"></span><button id="trocar" type="button">Trocar foto</button></div></div>
-<div id="load"><div class="sp"></div><p>Lendo a chave de acesso...</p></div>
+<div id="load"><div class="sp"></div><p id="loadtxt">Lendo a chave de acesso...</p></div>
 <div id="res"></div>
 </main>
 <footer>LUVI LOG Transportes</footer>
 <script>
 var chaveAtual = "";
+var arquivoAtual = null;
 
 document.getElementById("botao").onclick = function() {
     document.getElementById("arq").click();
@@ -140,11 +175,13 @@ document.getElementById("trocar").onclick = function() {
     document.getElementById("zona").style.display = "block";
     document.getElementById("res").style.display = "none";
     document.getElementById("arq").value = "";
+    arquivoAtual = null;
 };
 
 document.getElementById("arq").onchange = function() {
     var file = this.files[0];
     if (!file) return;
+    arquivoAtual = file;
 
     document.getElementById("nomeArq").textContent = file.name;
 
@@ -161,6 +198,7 @@ document.getElementById("arq").onchange = function() {
 
 function enviar(file) {
     document.getElementById("load").style.display = "block";
+    document.getElementById("loadtxt").textContent = "Lendo a chave de acesso...";
     document.getElementById("res").style.display = "none";
 
     var fd = new FormData();
@@ -182,6 +220,12 @@ function enviar(file) {
         mostrar({sucesso: false, erro: "Erro de conexao. Verifique sua internet."});
     };
     xhr.send(fd);
+}
+
+function tentarNovamente() {
+    if (arquivoAtual) {
+        enviar(arquivoAtual);
+    }
 }
 
 function mostrar(data) {
@@ -212,7 +256,9 @@ function mostrar(data) {
     } else {
         res.innerHTML = '<div class="card">'
             + '<div class="herr"><span class="berr">Erro</span><span>Nao foi possivel extrair</span></div>'
-            + '<div class="errmsg">' + data.erro + '</div></div>';
+            + '<div class="errmsg">' + data.erro + '</div>'
+            + '<div style="padding:0 1.2rem 1.2rem"><button id="retry" type="button" onclick="tentarNovamente()">Tentar novamente</button></div>'
+            + '</div>';
     }
 }
 
@@ -257,21 +303,7 @@ async def extrair_chave(foto: UploadFile = File(...)):
     mime = foto.content_type or "image/jpeg"
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                types.Part.from_bytes(data=conteudo, mime_type=mime),
-                PROMPT,
-            ],
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=300,
-            ),
-        )
-        texto = response.text.strip()
-        texto = re.sub(r"```json\s*", "", texto)
-        texto = re.sub(r"```\s*$", "", texto).strip()
-        resultado = json.loads(texto)
+        resultado = chamar_gemini(client, conteudo, mime)
     except Exception as e:
         return {"sucesso": False, "erro": "Erro ao processar: " + str(e)}
 
